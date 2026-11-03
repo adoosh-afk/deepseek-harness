@@ -252,6 +252,9 @@ export function apply(ctx: Context, config: Config): void {
         + ` sending that message as provider-neutral content (${reason})`,
       )
     },
+    onQueueWait: ({ provider, waitMs }) => {
+      if (waitMs > 0) ctx.logger.debug(`llm-pi-ai: provider "${provider}" request queued for ${Math.round(waitMs)}ms`)
+    },
   })
   // Independent of the route set: signing in is what makes a route worth
   // adding, so the flows are offered before any profile names their provider.

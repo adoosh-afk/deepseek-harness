@@ -61,6 +61,7 @@ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { requestImageTarget, toPiContext } from './context.ts'
 import { conversationUpdates, createModels, getSupportedThinkingLevels } from './models.ts'
+import { ProviderRequestQueue } from './provider-queue.ts'
 import { toStreamChunks } from './stream.ts'
 import type { PiAiRequestHeaderContext } from './types.ts'
 
@@ -126,6 +127,8 @@ export interface PiAiAdapterOptions {
    * conversion because its stored replay state is unusable by this build.
    */
   onReplayDegrade?: (detail: { provider: string; model: string; reason: string }) => void
+  /** Record time spent waiting for a provider's single active request slot. */
+  onQueueWait?: (detail: { provider: string; waitMs: number }) => void
 }
 
 /** The two auth injectables a pi-ai collection is built with. */
@@ -272,6 +275,7 @@ function requestHeaders(
  */
 export class PiAiAdapter extends LlmAdapter {
   private snapshot: PiAiSnapshot | undefined
+  private readonly providerQueue = new ProviderRequestQueue()
 
   constructor(private readonly config: PiAiAdapterOptions) {
     super()
@@ -425,6 +429,18 @@ export class PiAiAdapter extends LlmAdapter {
     )
     const apiKey = await this.config.resolveApiKey(options.provider, profile)
 
+    let lease: Awaited<ReturnType<ProviderRequestQueue['acquire']>> | undefined
+    if (!options.signal?.aborted) {
+      try {
+        lease = await this.providerQueue.acquire(options.provider, options.signal)
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw new LlmError('pi-ai request aborted by caller', 'ABORTED', { cause: error })
+        }
+        throw error
+      }
+    }
+
     const consumer = new AbortController()
     const upstream = options.signal === undefined
       ? consumer.signal
@@ -433,6 +449,7 @@ export class PiAiAdapter extends LlmAdapter {
     using watchdog = idleWatchdog(upstream, streamIdleTimeoutMs, 'LLM_STREAM_IDLE_TIMEOUT')
 
     try {
+      if (lease !== undefined) this.config.onQueueWait?.({ provider: options.provider, waitMs: lease.waitMs })
       const containsImage = options.messages.some(message => contentHasImage(message.content))
       if (containsImage && !model.input.includes('image')) {
         throw new LlmError(`pi-ai model "${model.id}" does not support image input`, 'UNSUPPORTED_CONTENT')
@@ -495,6 +512,7 @@ export class PiAiAdapter extends LlmAdapter {
       throw error
     } finally {
       consumer.abort('pi-ai stream consumer stopped')
+      lease?.release()
     }
   }
 }

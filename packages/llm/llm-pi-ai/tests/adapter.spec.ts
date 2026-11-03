@@ -1105,6 +1105,36 @@ describe('provider profile lifecycle', () => {
 })
 
 describe('abort wiring', () => {
+  it('queues calls fairly per provider and starts the stream timeout after admission', async () => {
+    const events = [
+      '{"choices":[{"delta":{"role":"assistant","content":""},"index":0,"finish_reason":null}]}',
+      ...Array.from({ length: 32 }, () => '{"choices":[{"delta":{"content":"x"},"index":0,"finish_reason":null}]}'),
+      '{"choices":[{"delta":{},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+      '[DONE]',
+    ]
+    const server = await mockServer([{ events, delayMs: 20 }, { events: textEvents }])
+    const queueWaits: number[] = []
+    const adapter = new PiAiAdapter({
+      profiles: () => resolveProfiles({ deepseek: { baseURL: server.url, streamIdleTimeoutMs: 500 } }),
+      resolveApiKey: () => Promise.resolve('test-key'),
+      auth: memoryAuth(),
+      onQueueWait: ({ waitMs }) => queueWaits.push(waitMs),
+    })
+    const drain = async (): Promise<void> => {
+      for await (const _chunk of adapter.stream({ provider: 'deepseek', model: 'deepseek-flash', messages: [] })) { /* drain */ }
+    }
+
+    const first = drain()
+    await server.requestReceived
+    const second = drain()
+    await new Promise(resolve => setTimeout(resolve, 550))
+    expect(server.requests).toHaveLength(1)
+    await Promise.all([first, second])
+    expect(server.requests).toHaveLength(2)
+    expect(queueWaits).toHaveLength(2)
+    expect(queueWaits[1]).toBeGreaterThan(500)
+  })
+
   it('preserves an unknown pre-dispatch adapter Error exactly', async () => {
     const original = new Error('SDK context conversion exploded')
     const message = Object.defineProperty({}, 'content', {
